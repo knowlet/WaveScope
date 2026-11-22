@@ -31,6 +31,13 @@ class MainWindow(MainWindowLogicMixin, MainWindowUIMixin, QMainWindow):
         # kept referenced so Qt never destroys a running QThread.
         self._retired_scanners: List[WiFiScanner] = []
         self._scanner: Optional[WiFiScanner] = None
+        # Each start/pause bumps this. Scanner signals carry the generation
+        # they were started with and are ignored once it is no longer current.
+        self._scan_generation = 0
+        # Resume (or a source change) asked for a scan while a native call
+        # that cannot be cancelled is still running.
+        self._start_when_idle = False
+        self._closing = False
         # Latest cross-AP analysis (congestion / BSS color / roaming)
         self._channel_stats: Dict[Tuple[str, int], ChannelStats] = {}
         self._color_collisions: Dict[str, List[AccessPoint]] = {}

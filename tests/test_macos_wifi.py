@@ -206,7 +206,7 @@ def test_hidden_ssid_with_real_bssid_is_preserved(bridge):
 @pytest.mark.parametrize('bssid', [None, '', '<redacted>', '00:00:00:00:00:00', 'ff:ff:ff:ff:ff:ff'])
 def test_redacted_identities_raise_actionable_error(bridge, bssid):
     bridge.interfaces = [interface(networks=[network(bssid=bssid)])]
-    with pytest.raises(RuntimeError, match='withheld network BSSIDs.*Location Services'):
+    with pytest.raises(mac.LocationPermissionError, match='withheld network BSSIDs.*Location Services'):
         mac.scan_corewlan()
 
 
@@ -255,7 +255,7 @@ def test_permission_denial_never_triggers_scan(bridge, enabled, status):
     bridge.enabled, bridge.status = enabled, status
     iface = interface(networks=[network()])
     bridge.interfaces = [iface]
-    with pytest.raises(RuntimeError, match='Location Services'):
+    with pytest.raises(mac.LocationPermissionError, match='Location Services'):
         mac.scan_corewlan()
     assert iface.calls == 0 and bridge.pools == 0
 
@@ -329,7 +329,7 @@ def test_unknown_authorization_status_does_not_scan(bridge):
     bridge.status = 999
     iface = interface(networks=[network()])
     bridge.interfaces = [iface]
-    with pytest.raises(RuntimeError, match='Unknown Location Services authorization'):
+    with pytest.raises(mac.LocationPermissionError, match='Unknown Location Services authorization'):
         mac.scan_corewlan()
     assert iface.calls == 0
 

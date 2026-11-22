@@ -1,5 +1,8 @@
 """Platform routing, UI capabilities and incomplete native scan evidence."""
 
+import threading
+import time
+
 import pytest
 from PyQt6.QtCore import QObject, QSettings, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QApplication
@@ -70,7 +73,7 @@ def test_native_failure_keeps_last_observation_and_reports_error(monkeypatch):
     scans, errors, notes = [], [], []
 
     def fail(_event):
-        raise RuntimeError("Allow WaveScope in Location Services")
+        raise RuntimeError("CoreWLAN scan failed: en0: radio busy")
 
     monkeypatch.setattr(macos_wifi, "scan_corewlan", fail)
     scanner.data_ready.connect(scans.append)
@@ -79,7 +82,49 @@ def test_native_failure_keeps_last_observation_and_reports_error(monkeypatch):
     scanner.run()
     assert scans == []
     assert len(scanner._seen_cache) == 1
+    assert notes == errors == ["CoreWLAN scan failed: en0: radio busy"]
+
+
+def test_location_permission_loss_clears_published_results(monkeypatch):
+    monkeypatch.setattr(core_scanner, "IS_MACOS", True)
+    scanner = core_scanner.WiFiScanner()
+    scanner._merge_linger([ap()])
+    scans, errors, notes = [], [], []
+
+    def fail(_event):
+        raise macos_wifi.LocationPermissionError("Allow WaveScope in Location Services")
+
+    monkeypatch.setattr(macos_wifi, "scan_corewlan", fail)
+    scanner.data_ready.connect(scans.append)
+    scanner.status_note.connect(notes.append)
+    scanner.scan_error.connect(lambda msg: (errors.append(msg), scanner._stop_event.set()))
+    scanner.run()
+    assert scans == [[]]
+    assert scanner._seen_cache == {}
     assert notes == errors == ["Allow WaveScope in Location Services"]
+
+
+def test_cancelled_generation_is_not_published(monkeypatch):
+    """A result that returns after cancel is dropped even if stop is not set.
+
+    The older loop treated only stop_event as "do not publish". Pause cancels
+    the generation under the same lock as publish, including when the native
+    call has already returned and cleared the stop flag.
+    """
+    monkeypatch.setattr(core_scanner, "IS_MACOS", True)
+    scanner = core_scanner.WiFiScanner()
+    published = []
+
+    def scan(stop_event):
+        scanner.cancel_generation()
+        stop_event.clear()
+        return [ap(ssid="Stale")], ""
+
+    monkeypatch.setattr(macos_wifi, "scan_corewlan", scan)
+    scanner.data_ready.connect(published.append)
+    scanner.run()
+    assert published == []
+    assert scanner._seen_cache == {}
 
 
 def test_native_scan_finishing_after_stop_does_not_publish(monkeypatch):
@@ -261,5 +306,151 @@ def test_macos_close_catches_scan_finishing_during_running_check(monkeypatch, tm
         QApplication.processEvents()
         assert not window.isVisible()
         assert window._retired_scanners == []
+    finally:
+        window.close()
+
+
+def _wait_until(predicate, timeout=3.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        QApplication.processEvents()
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def test_location_permission_loss_clears_rows_on_screen(monkeypatch, tmp_path):
+    from wavescope_app import main_window
+
+    monkeypatch.setattr(core_scanner, "IS_MACOS", True)
+    settings = QSettings(str(tmp_path / "permission.ini"), QSettings.Format.IniFormat)
+    monkeypatch.setattr(main_window, "QSettings", lambda *_: settings)
+    window = main_window.MainWindow(start_scanner=False)
+    scanner = core_scanner.WiFiScanner()
+    window._scan_generation = 1
+    scanner.generation = 1
+    window._scanner = scanner
+    window._connect_scanner(scanner, 1)
+    seed = ap(ssid="Visible")
+    window._on_data([seed])
+    scanner._merge_linger([seed])
+    assert window._model.rowCount() == 1
+
+    def fail(_event):
+        raise macos_wifi.LocationPermissionError("Allow WaveScope in Location Services")
+
+    monkeypatch.setattr(macos_wifi, "scan_corewlan", fail)
+    scanner.scan_error.connect(lambda _msg: scanner._stop_event.set())
+    window.show()
+    try:
+        scanner.run()
+        assert window._model.rowCount() == 0
+        assert window._aps == []
+        assert "Location Services" in window.statusBar().currentMessage()
+        assert window._scan_overlay.isVisible()
+        assert "Location Services" in window._scan_overlay_lbl.text()
+    finally:
+        window.close()
+
+
+def test_pause_resume_does_not_overlap_native_scans(monkeypatch, tmp_path):
+    """Resume while a CoreWLAN call is blocked must not enter scan_corewlan again.
+
+    The blocked call's results belong to the cancelled generation and stay
+    off the table. The scan started after it finishes is the one that lands.
+    """
+    from wavescope_app import main_window, main_window_logic
+
+    class Gate:
+        def __init__(self):
+            self.cv = threading.Condition()
+            self.started = 0
+            self.released = 0
+
+        def run(self, stop_event):
+            with self.cv:
+                self.started += 1
+                index = self.started
+                self.cv.notify_all()
+                deadline = time.monotonic() + 5
+                while self.released < index and time.monotonic() < deadline:
+                    self.cv.wait(timeout=0.05)
+            if index == 1:
+                return [ap(ssid="Cancelled", bssid="02:00:00:00:00:11")], ""
+            return [ap(ssid="Live", bssid="02:00:00:00:00:22")], ""
+
+        def release_one(self):
+            with self.cv:
+                self.released += 1
+                self.cv.notify_all()
+
+        def release_all(self):
+            with self.cv:
+                self.released = max(self.released, self.started) + 5
+                self.cv.notify_all()
+
+    monkeypatch.setattr(core_scanner, "IS_MACOS", True)
+    monkeypatch.setattr(main_window_logic, "IS_MACOS", True)
+    gate = Gate()
+    monkeypatch.setattr(macos_wifi, "scan_corewlan", gate.run)
+    settings = QSettings(str(tmp_path / "overlap.ini"), QSettings.Format.IniFormat)
+    monkeypatch.setattr(main_window, "QSettings", lambda *_: settings)
+    window = main_window.MainWindow(start_scanner=False)
+    window._interval_combo.setCurrentIndex(window._interval_combo.count() - 1)
+    window._on_data([ap(ssid="Old")])
+    try:
+        assert window._start_scanner()
+        assert _wait_until(lambda: gate.started == 1)
+        window._btn_pause.setChecked(True)
+        assert gate.started == 1
+        assert window._scanner is None
+        assert window._retired_scan_running()
+
+        window._btn_pause.setChecked(False)
+        assert gate.started == 1
+        assert window._start_when_idle
+        assert "current scan" in window.statusBar().currentMessage()
+
+        gate.release_one()
+        assert _wait_until(lambda: gate.started == 2)
+        assert [a.ssid for a in window._aps] == ["Old"]
+
+        gate.release_one()
+        assert _wait_until(lambda: [a.ssid for a in window._aps] == ["Live"])
+        assert gate.started == 2
+    finally:
+        window._closing = True
+        window._start_when_idle = False
+        gate.release_all()
+        QApplication.processEvents()
+        for scanner in [window._scanner, *list(window._retired_scanners)]:
+            if scanner is not None:
+                scanner.stop(None)
+        QApplication.processEvents()
+        window.close()
+
+
+def test_queued_result_from_cancelled_generation_is_ignored(monkeypatch, tmp_path):
+    from wavescope_app import main_window
+
+    settings = QSettings(str(tmp_path / "generation.ini"), QSettings.Format.IniFormat)
+    monkeypatch.setattr(main_window, "QSettings", lambda *_: settings)
+    window = main_window.MainWindow(start_scanner=False)
+    scanner = core_scanner.WiFiScanner()
+    window._scan_generation = 1
+    scanner.generation = 1
+    window._scanner = scanner
+    window._connect_scanner(scanner, 1)
+    try:
+        scanner.data_ready.emit([ap(ssid="Live")])
+        assert [a.ssid for a in window._aps] == ["Live"]
+        window._scan_generation += 1
+        scanner.data_ready.emit([ap(ssid="Stale", bssid="02:00:00:00:00:99")])
+        scanner.scan_error.emit("stale error")
+        scanner.status_note.emit("stale note")
+        assert [a.ssid for a in window._aps] == ["Live"]
+        assert "stale error" not in window.statusBar().currentMessage()
+        assert window._state_note != "stale note"
     finally:
         window.close()

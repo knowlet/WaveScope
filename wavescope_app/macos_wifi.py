@@ -29,6 +29,14 @@ LOCATION_HELP = (
 )
 
 
+class LocationPermissionError(RuntimeError):
+    """Location Services is off, denied, restricted, or withholding identities.
+
+    Distinct from a radio or API failure: previously scanned names and BSSIDs
+    must not stay on screen after this permission is lost.
+    """
+
+
 def _load_frameworks():
     return tuple(importlib.import_module(name) for name in ("objc", "CoreWLAN", "CoreLocation"))
 
@@ -354,8 +362,9 @@ def _error_text(error):
 def scan_corewlan(stop_event: Event | None = None) -> tuple[list[AccessPoint], str]:
     """Scan all native Wi-Fi interfaces, returning APs and an optional notice.
 
-    A failed/denied scan raises RuntimeError; it must never look like a
-    successful empty result. Cancellation is observed between native calls.
+    A failed scan raises RuntimeError and must never look like a successful
+    empty result. Losing Location Services raises LocationPermissionError.
+    Cancellation is observed between native calls.
     """
     if stop_event is not None and stop_event.is_set():
         return [], ""
@@ -366,15 +375,17 @@ def scan_corewlan(stop_event: Event | None = None) -> tuple[list[AccessPoint], s
     with objc.autorelease_pool():
         manager = location.CLLocationManager
         if not manager.locationServicesEnabled():
-            raise RuntimeError(LOCATION_HELP)
+            raise LocationPermissionError(LOCATION_HELP)
         status = manager.authorizationStatus()
         if status in (location.kCLAuthorizationStatusDenied, location.kCLAuthorizationStatusRestricted):
-            raise RuntimeError(LOCATION_HELP)
+            raise LocationPermissionError(LOCATION_HELP)
         if status == location.kCLAuthorizationStatusNotDetermined:
             return [], "Waiting for Location Services permission. " + LOCATION_HELP
         if status not in (location.kCLAuthorizationStatusAuthorizedAlways,
                           location.kCLAuthorizationStatusAuthorizedWhenInUse):
-            raise RuntimeError(f"Unknown Location Services authorization status ({status}). " + LOCATION_HELP)
+            raise LocationPermissionError(
+                f"Unknown Location Services authorization status ({status}). " + LOCATION_HELP
+            )
 
         client = framework.CWWiFiClient.sharedWiFiClient()
         # interfaces() has been an instance method since macOS 10.10;
@@ -427,7 +438,7 @@ def scan_corewlan(stop_event: Event | None = None) -> tuple[list[AccessPoint], s
         if not powered:
             return [], "Wi-Fi is turned off — enable Wi-Fi in macOS to scan."
         if redacted and not aps:
-            raise RuntimeError("macOS withheld network BSSIDs. " + LOCATION_HELP)
+            raise LocationPermissionError("macOS withheld network BSSIDs. " + LOCATION_HELP)
         notes = []
         if errors:
             notes.append("Some interfaces could not be scanned: " + "; ".join(errors))

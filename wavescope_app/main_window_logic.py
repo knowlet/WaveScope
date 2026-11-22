@@ -245,8 +245,8 @@ class MainWindowLogicMixin:
         _inherit_radio_params(aps)
 
     def _on_data(self, aps: List[AccessPoint]):
-        if self.sender() is not None and self.sender() is not self._scanner:
-            return  # late emission from a scanner that is shutting down
+        if not self._scan_signal_is_current():
+            return  # late emission from a cancelled scan generation
 
         # ── sticky-nonzero field restoration ────────────────────────────────
         # For nmcli/iw fields that can transiently return 0/""/None even though
@@ -477,6 +477,8 @@ class MainWindowLogicMixin:
             self._connection_widget.setStyleSheet(details_style)
 
     def _on_error(self, msg: str):
+        if not self._scan_signal_is_current():
+            return
         self.statusBar().showMessage(f"⚠ Scanner error: {msg}")
 
     def _on_col_resized(self, col: int, old_size: int, new_size: int):
@@ -507,18 +509,107 @@ class MainWindowLogicMixin:
 
     # ── Scanner lifecycle ────────────────────────────────────────────────
 
-    def _start_scanner(self) -> None:
-        """Create and start a scanner using the current toolbar settings."""
-        self._scanner = WiFiScanner(
+    def _scanner_stop_timeout(self) -> int:
+        """How long the UI thread may block while asking a scanner to exit.
+
+        CoreWLAN has no cancel API. Waiting on it freezes the window and
+        still cannot stop the native call, so macOS returns immediately and
+        the state machine below starts the next scan only after this one
+        leaves scanForNetworks.
+        """
+        return 0 if IS_MACOS else 3000
+
+    def _retired_scan_running(self) -> bool:
+        return any(sc.isRunning() for sc in self._retired_scanners)
+
+    def _scan_signal_is_current(self) -> bool:
+        """True for direct UI calls and for the scanner generation still in force.
+
+        A queued signal keeps its sender. After pause/resume that sender's
+        generation no longer matches, and its rows/errors are ignored.
+        Direct calls (review mode, tests) have no sender and always apply.
+        Slots invoked by _connect_scanner already matched the generation;
+        sender() is not reliable once that slot has called into these handlers.
+        """
+        if getattr(self, "_in_scan_delivery", False):
+            return True
+        sender = self.sender()
+        if sender is None:
+            return True
+        generation = getattr(sender, "generation", None)
+        if generation is None:
+            return sender is self._scanner
+        return generation == self._scan_generation and sender is self._scanner
+
+    def _deliver_scan_signal(self, fn, *args) -> None:
+        self._in_scan_delivery = True
+        try:
+            fn(*args)
+        finally:
+            self._in_scan_delivery = False
+
+    def _connect_scanner(self, scanner, generation: int) -> None:
+        """Deliver this scanner's signals only while its generation is current.
+
+        The generation is closed over here so a signal queued before pause
+        is ignored even if QObject.sender() is unavailable when it is delivered.
+        """
+
+        def current() -> bool:
+            return generation == self._scan_generation and scanner is self._scanner
+
+        def on_data(aps, current=current):
+            if current():
+                self._deliver_scan_signal(self._on_data, aps)
+
+        def on_error(msg, current=current):
+            if current():
+                self._deliver_scan_signal(self._on_error, msg)
+
+        def on_source(source, current=current):
+            if current():
+                self._deliver_scan_signal(self._on_source_active, source)
+
+        def on_note(text, current=current):
+            if current():
+                self._deliver_scan_signal(self._on_status_note, text)
+
+        # Keep the callables alive for as long as the scanner is.
+        scanner._signal_slots = (on_data, on_error, on_source, on_note)
+        scanner.data_ready.connect(on_data)
+        scanner.scan_error.connect(on_error)
+        scanner.source_active.connect(on_source)
+        scanner.status_note.connect(on_note)
+
+    def _start_scanner(self) -> bool:
+        """Create and start a scanner using the current toolbar settings.
+
+        Returns False when a previous native scan is still in flight. The
+        finished signal of that scan starts this one, so two CoreWLAN scans
+        are never outstanding together.
+        """
+        if self._closing:
+            return False
+        if self._retired_scan_running():
+            self._start_when_idle = True
+            self.statusBar().showMessage(
+                "Waiting for the current scan to finish before starting another…"
+            )
+            return False
+        self._start_when_idle = False
+        self._scan_generation += 1
+        generation = self._scan_generation
+        scanner = WiFiScanner(
             interval_sec=REFRESH_INTERVALS[self._interval_combo.currentIndex()],
             linger_secs=float(self._linger_spin.value()),
             source=self._data_source,
         )
-        self._scanner.data_ready.connect(self._on_data)
-        self._scanner.scan_error.connect(self._on_error)
-        self._scanner.source_active.connect(self._on_source_active)
-        self._scanner.status_note.connect(self._on_status_note)
-        self._scanner.start()
+        scanner.generation = generation
+        self._connect_scanner(scanner, generation)
+        # Assign before start so a fast first result still sees this scanner.
+        self._scanner = scanner
+        scanner.start()
+        return True
 
     def show_tool_notices(self, notes: List[str]) -> None:
         """Show absent-optional-tool notes in the in-window banner."""
@@ -534,6 +625,8 @@ class MainWindowLogicMixin:
         Kept in _state_note so _on_data can show it in the status bar and,
         while the table is empty, in the overlay instead of "Scanning…".
         """
+        if not self._scan_signal_is_current():
+            return
         self._state_note = text
         if hasattr(self, "_scan_overlay"):
             self._scan_overlay_lbl.setText(text or "Scanning for networks…")
@@ -554,11 +647,15 @@ class MainWindowLogicMixin:
         for cache in (self._sticky_cache, self._iw_cache, self._iw_seen_at, self._conn_counter_prev):
             cache.clear()
         if self._scanner is not None:  # not paused
-            self._stop_scanner()
-            self._start_scanner()
+            self._scan_generation += 1
+            self._stop_scanner(self._scanner_stop_timeout())
+            if not self._start_scanner():
+                return
         self.statusBar().showMessage("Data source changed — re-scanning…")
 
     def _on_source_active(self, source: str) -> None:
+        if not self._scan_signal_is_current():
+            return
         if source == "corewlan":
             txt, tip = "  Source: CoreWLAN  ", "Native macOS Wi-Fi scans"
         elif source == "iw":
@@ -584,19 +681,46 @@ class MainWindowLogicMixin:
             return
         if not sc.stop(wait_ms):
             self._retired_scanners.append(sc)
-            sc.finished.connect(lambda s=sc: self._retired_scanners.remove(s) if s in self._retired_scanners else None)
+            sc.finished.connect(lambda s=sc: self._deliver_retired_scanner_finished(s))
+
+    def _deliver_retired_scanner_finished(self, scanner) -> None:
+        """Run the finished handler on the GUI thread.
+
+        QThread.finished is emitted from the worker. A plain callable would
+        run there; widget updates and the next QThread must be started on
+        the thread that owns this window. Close-path fakes emit on the GUI
+        thread and need the handler immediately, before close() continues.
+        """
+        app = QApplication.instance()
+        if app is not None and QThread.currentThread() is not app.thread():
+            QTimer.singleShot(0, self, lambda s=scanner: self._on_retired_scanner_finished(s))
+            return
+        self._on_retired_scanner_finished(scanner)
+
+    def _on_retired_scanner_finished(self, scanner) -> None:
+        try:
+            self._retired_scanners.remove(scanner)
+        except ValueError:
+            return
+        if self._closing or not self._start_when_idle or self._retired_scan_running():
+            return
+        self._start_scanner()
 
     def _on_pause(self, paused: bool):
         if paused:
-            self._stop_scanner()
+            # Invalidate before stop so a result already queued, or one that
+            # returns from the native call during the wait, is not applied.
+            self._start_when_idle = False
+            self._scan_generation += 1
+            self._stop_scanner(self._scanner_stop_timeout())
             self._btn_pause.setText("▶ Resume")
             self.statusBar().showMessage("Paused — click Resume to continue scanning")
         else:
             if self._review_mode:
                 self._end_review_banner()
-            self._start_scanner()
             self._btn_pause.setText("⏸ Pause")
-            self.statusBar().showMessage("Resumed scanning…")
+            if self._start_scanner():
+                self.statusBar().showMessage("Resumed scanning…")
 
     def _on_monitor_mode(self):
         if IS_MACOS:
@@ -1663,6 +1787,10 @@ class MainWindowLogicMixin:
         self.statusBar().showMessage(msg)
 
     def closeEvent(self, event):
+        # Set before stopping scanners so a native scan that finishes during
+        # close cannot start another one.
+        self._closing = True
+        self._start_when_idle = False
         # A running capture has taken the interface out of NetworkManager's
         # control (or stopped NM); restore it before the app goes away.
         busy = [

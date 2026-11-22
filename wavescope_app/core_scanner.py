@@ -1883,6 +1883,13 @@ class WiFiScanner(QThread):
         self._stop_event = threading.Event()
         self._clear_cache_requested = False
         self._survey = SurveyTracker()
+        # cancel_generation() sets this under the lock before an in-flight
+        # CoreWLAN call returns. Publish checks it so that generation's
+        # results are never delivered. One WiFiScanner is one generation.
+        self._emit_lock = threading.Lock()
+        self._generation_cancelled = False
+        self._permission_withheld = False
+        self.generation = 0
 
     def set_interval(self, secs: int):
         self._interval = secs
@@ -1894,6 +1901,24 @@ class WiFiScanner(QThread):
     def request_cache_clear(self):
         """Drop lingering APs on the next cycle (e.g. after an OUI DB update)."""
         self._clear_cache_requested = True
+
+    def cancel_generation(self) -> None:
+        """Ignore any result this scanner has not published yet."""
+        with self._emit_lock:
+            self._generation_cancelled = True
+
+    def _publish(self, fn) -> bool:
+        """Publish one result if this generation is still current.
+
+        The check and the emit share the lock with cancel_generation(), so a
+        pause that lands after the native call returns cannot publish.
+        Returns False when the caller should leave the scan loop.
+        """
+        with self._emit_lock:
+            if self._generation_cancelled or self._stop_event.is_set():
+                return False
+            fn()
+            return True
 
     def _trigger_rescan(self) -> None:
         """Ask NetworkManager for a fresh scan (iw source).
@@ -1997,24 +2022,55 @@ class WiFiScanner(QThread):
         # The synchronous native scan runs off the UI thread. CoreWLAN has
         # no cancellation API: retain this QThread until an in-flight scan
         # returns, and never emit a late result after pause/close.
-        from .macos_wifi import scan_corewlan
+        from .macos_wifi import LocationPermissionError, scan_corewlan
 
         while not self._stop_event.is_set():
             try:
                 aps, note = scan_corewlan(self._stop_event)
-                if self._stop_event.is_set():
+                if not self._publish_corewlan(aps, note):
                     break
-                self._emit_note(note)
-                self.source_active.emit(self.SOURCE_COREWLAN)
-                self.data_ready.emit(self._merge_linger(aps))
+            except LocationPermissionError as exc:
+                if not self._publish_permission_loss(exc):
+                    break
             except Exception as exc:
-                if self._stop_event.is_set():
+                if not self._publish_scan_failure(exc):
                     break
-                # Keep previous observations on a failed scan; an API or
-                # privacy failure is not a successful empty RF scan.
-                self._emit_note(str(exc))
-                self.scan_error.emit(str(exc))
             self._stop_event.wait(max(self._interval, 1))
+
+    def _publish_corewlan(self, aps, note: str) -> bool:
+        def emit():
+            self._permission_withheld = False
+            self._emit_note(note)
+            self.source_active.emit(self.SOURCE_COREWLAN)
+            self.data_ready.emit(self._merge_linger(aps))
+
+        return self._publish(emit)
+
+    def _publish_permission_loss(self, exc: Exception) -> bool:
+        """Drop cached identities and clear the table once per denial."""
+        text = str(exc)
+
+        def emit():
+            had_identities = bool(self._seen_cache) or not self._permission_withheld
+            self._seen_cache.clear()
+            self._permission_withheld = True
+            self._emit_note(text)
+            if had_identities:
+                self.data_ready.emit([])
+            self.scan_error.emit(text)
+
+        return self._publish(emit)
+
+    def _publish_scan_failure(self, exc: Exception) -> bool:
+        # A radio or API failure is not an empty RF scan and it is not a
+        # permission change, so the last published rows stay put.
+        text = str(exc)
+
+        def emit():
+            self._emit_note(text)
+            self.scan_error.emit(text)
+
+        return self._publish(emit)
 
     def _emit_note(self, text: str) -> None:
         """Emit status_note only when the text changes (keeps the GUI quiet)."""
@@ -2062,7 +2118,10 @@ class WiFiScanner(QThread):
         Linux subprocesses are killed within ~200 ms (see run_tool). An
         in-flight CoreWLAN call must return before the thread can exit.
         Pass wait_ms=None to wait until all native work has finished.
+        The current generation is cancelled before the wait, so a call that
+        returns during or after stop() does not publish.
         """
+        self.cancel_generation()
         self._stop_event.set()
         if wait_ms is None:
             return self.wait()
