@@ -909,6 +909,17 @@ class SignalHistoryWidget(QWidget):
         # next scan.
         self._redraw(time.time() - self._t0)
 
+    def clear(self) -> None:
+        """Forget every sample, curve and legend entry.
+
+        ``push([])`` keeps recent samples on purpose, so an empty scan does
+        not erase the trace. Revoked permission must erase it: the legend
+        shows SSIDs and full BSSIDs that the user no longer allows.
+        """
+        self._history.clear()
+        self._ssid_map.clear()
+        self._redraw(time.time() - self._t0)
+
     def push(self, aps: List[AccessPoint]):
         now = time.time()
         elapsed = now - self._t0

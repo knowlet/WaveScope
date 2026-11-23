@@ -37,6 +37,15 @@ class LocationPermissionError(RuntimeError):
     """
 
 
+class LocationPermissionPending(LocationPermissionError):
+    """Location Services has not been decided yet.
+
+    No identities may be shown while the prompt is open, including ones
+    cached from an earlier authorized scan, so this takes the same path as a
+    revoked permission. It is reported as a status note, not a scan error.
+    """
+
+
 def _load_frameworks():
     return tuple(importlib.import_module(name) for name in ("objc", "CoreWLAN", "CoreLocation"))
 
@@ -380,7 +389,7 @@ def scan_corewlan(stop_event: Event | None = None) -> tuple[list[AccessPoint], s
         if status in (location.kCLAuthorizationStatusDenied, location.kCLAuthorizationStatusRestricted):
             raise LocationPermissionError(LOCATION_HELP)
         if status == location.kCLAuthorizationStatusNotDetermined:
-            return [], "Waiting for Location Services permission. " + LOCATION_HELP
+            raise LocationPermissionPending("Waiting for Location Services permission. " + LOCATION_HELP)
         if status not in (location.kCLAuthorizationStatusAuthorizedAlways,
                           location.kCLAuthorizationStatusAuthorizedWhenInUse):
             raise LocationPermissionError(

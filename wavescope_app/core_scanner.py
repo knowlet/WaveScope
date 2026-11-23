@@ -1858,6 +1858,9 @@ class WiFiScanner(QThread):
 
     data_ready = pyqtSignal(list)  # list[AccessPoint]
     scan_error = pyqtSignal(str)
+    # Emitted when Location Services stops covering identities that were
+    # already published, so views that keep their own history drop them.
+    identities_revoked = pyqtSignal()
     source_active = pyqtSignal(str)  # data source actually used this cycle
     status_note = pyqtSignal(str)  # neutral state description (no interface, no NM, …)
 
@@ -2047,8 +2050,16 @@ class WiFiScanner(QThread):
         return self._publish(emit)
 
     def _publish_permission_loss(self, exc: Exception) -> bool:
-        """Drop cached identities and clear the table once per denial."""
+        """Drop cached identities and clear every view once per denial.
+
+        A pending authorization takes the same path: nothing scanned under
+        an earlier grant may stay visible while the prompt is open. It is
+        reported as a note only, because waiting is not a failure.
+        """
+        from .macos_wifi import LocationPermissionPending
+
         text = str(exc)
+        pending = isinstance(exc, LocationPermissionPending)
 
         def emit():
             had_identities = bool(self._seen_cache) or not self._permission_withheld
@@ -2057,7 +2068,9 @@ class WiFiScanner(QThread):
             self._emit_note(text)
             if had_identities:
                 self.data_ready.emit([])
-            self.scan_error.emit(text)
+                self.identities_revoked.emit()
+            if not pending:
+                self.scan_error.emit(text)
 
         return self._publish(emit)
 

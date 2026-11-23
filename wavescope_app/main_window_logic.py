@@ -574,12 +574,17 @@ class MainWindowLogicMixin:
             if current():
                 self._deliver_scan_signal(self._on_status_note, text)
 
+        def on_revoked(current=current):
+            if current():
+                self._deliver_scan_signal(self._history_graph.clear)
+
         # Keep the callables alive for as long as the scanner is.
-        scanner._signal_slots = (on_data, on_error, on_source, on_note)
+        scanner._signal_slots = (on_data, on_error, on_source, on_note, on_revoked)
         scanner.data_ready.connect(on_data)
         scanner.scan_error.connect(on_error)
         scanner.source_active.connect(on_source)
         scanner.status_note.connect(on_note)
+        scanner.identities_revoked.connect(on_revoked)
 
     def _start_scanner(self) -> bool:
         """Create and start a scanner using the current toolbar settings.
@@ -1787,10 +1792,6 @@ class MainWindowLogicMixin:
         self.statusBar().showMessage(msg)
 
     def closeEvent(self, event):
-        # Set before stopping scanners so a native scan that finishes during
-        # close cannot start another one.
-        self._closing = True
-        self._start_when_idle = False
         # A running capture has taken the interface out of NetworkManager's
         # control (or stopped NM); restore it before the app goes away.
         busy = [
@@ -1808,8 +1809,16 @@ class MainWindowLogicMixin:
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             )
             if ans != QMessageBox.StandardButton.Yes:
+                # The window stays open, so scanning must keep working.
                 event.ignore()
                 return
+
+        # Set only once the close is certain, and before anything below runs
+        # the event loop or stops scanners, so a native scan that finishes
+        # during close cannot start another one.
+        self._closing = True
+        self._start_when_idle = False
+        if busy:
             self.statusBar().showMessage("Stopping capture and restoring the interface…")
             QApplication.processEvents()
             for w in busy:
