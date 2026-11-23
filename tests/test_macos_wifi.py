@@ -264,8 +264,11 @@ def test_pending_authorization_has_notice_and_does_not_request_from_worker(bridg
     bridge.status = 0
     iface = interface(networks=[network()])
     bridge.interfaces = [iface]
-    aps, note = mac.scan_corewlan()
-    assert aps == [] and 'Waiting for Location Services permission' in note
+    # Pending authorization must not look like a successful empty scan: the
+    # scanner would republish lingering identities from an earlier grant.
+    with pytest.raises(mac.LocationPermissionPending, match='Waiting for Location Services permission'):
+        mac.scan_corewlan()
+    assert issubclass(mac.LocationPermissionPending, mac.LocationPermissionError)
     assert iface.calls == 0
 
 

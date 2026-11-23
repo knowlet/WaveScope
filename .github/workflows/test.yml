@@ -48,7 +48,7 @@ jobs:
         run: |
           python -m compileall -q wavescope_app main.py
           python -m ruff check
-          bash -n install.sh wavescope scripts/build_macos.sh
+          for script in install.sh wavescope scripts/build_macos.sh; do bash -n "$script"; done
       - name: Tests
         run: python -m pytest -q tests
       - name: Native macOS framework imports

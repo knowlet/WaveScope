@@ -104,6 +104,29 @@ def test_location_permission_loss_clears_published_results(monkeypatch):
     assert notes == errors == ["Allow WaveScope in Location Services"]
 
 
+def test_pending_authorization_clears_lingering_identities(monkeypatch):
+    """A reset to NotDetermined after a grant must not replay cached rows."""
+    monkeypatch.setattr(core_scanner, "IS_MACOS", True)
+    scanner = core_scanner.WiFiScanner()
+    scanner._merge_linger([ap(ssid="Earlier")])
+    scans, errors, notes, revoked = [], [], [], []
+
+    def pending(_event):
+        raise macos_wifi.LocationPermissionPending("Waiting for Location Services permission.")
+
+    monkeypatch.setattr(macos_wifi, "scan_corewlan", pending)
+    scanner.data_ready.connect(scans.append)
+    scanner.scan_error.connect(errors.append)
+    scanner.identities_revoked.connect(lambda: revoked.append(True))
+    scanner.status_note.connect(lambda text: (notes.append(text), scanner._stop_event.set()))
+    scanner.run()
+    assert scans == [[]]
+    assert scanner._seen_cache == {}
+    assert revoked == [True]
+    assert notes == ["Waiting for Location Services permission."]
+    assert errors == []
+
+
 def test_cancelled_generation_is_not_published(monkeypatch):
     """A result that returns after cancel is dropped even if stop is not set.
 
@@ -351,6 +374,81 @@ def test_location_permission_loss_clears_rows_on_screen(monkeypatch, tmp_path):
         assert window._scan_overlay.isVisible()
         assert "Location Services" in window._scan_overlay_lbl.text()
     finally:
+        window.close()
+
+
+def test_location_permission_loss_clears_signal_history(monkeypatch, tmp_path):
+    """The history legend shows SSIDs and full BSSIDs; revocation must erase it."""
+    from wavescope_app import main_window
+
+    monkeypatch.setattr(core_scanner, "IS_MACOS", True)
+    settings = QSettings(str(tmp_path / "history.ini"), QSettings.Format.IniFormat)
+    monkeypatch.setattr(main_window, "QSettings", lambda *_: settings)
+    window = main_window.MainWindow(start_scanner=False)
+    scanner = core_scanner.WiFiScanner()
+    window._scan_generation = 1
+    scanner.generation = 1
+    window._scanner = scanner
+    window._connect_scanner(scanner, 1)
+    seed = ap(ssid="Visible", bssid="02:00:00:00:00:42")
+    window._on_data([seed])
+    window._on_data([seed])
+    scanner._merge_linger([seed])
+    history = window._history_graph
+    assert "02:00:00:00:00:42" in history._history
+    assert history._ssid_list.count() == 1
+
+    def fail(_event):
+        raise macos_wifi.LocationPermissionError("Allow WaveScope in Location Services")
+
+    monkeypatch.setattr(macos_wifi, "scan_corewlan", fail)
+    scanner.scan_error.connect(lambda _msg: scanner._stop_event.set())
+    try:
+        scanner.run()
+        assert dict(history._history) == {}
+        assert history._ssid_map == {}
+        assert history._curves == {}
+        assert history._ssid_list.count() == 0
+    finally:
+        window.close()
+
+
+def test_cancelled_quit_keeps_scanning_available(monkeypatch, tmp_path):
+    """Cancelling the capture prompt leaves the window able to scan again."""
+    from PyQt6.QtGui import QCloseEvent
+    from PyQt6.QtWidgets import QMessageBox
+
+    from wavescope_app import main_window
+
+    settings = QSettings(str(tmp_path / "cancel.ini"), QSettings.Format.IniFormat)
+    monkeypatch.setattr(main_window, "QSettings", lambda *_: settings)
+    window = main_window.MainWindow(start_scanner=False)
+
+    class BusyCapture:
+        def is_busy(self):
+            return True
+
+        def shutdown_blocking(self):
+            raise AssertionError("cancel must not stop the capture")
+
+    window._monitor_win = BusyCapture()
+    monkeypatch.setattr(QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.StandardButton.Cancel))
+    started = []
+    monkeypatch.setattr(window, "_retired_scan_running", lambda: False)
+    try:
+        event = QCloseEvent()
+        window.closeEvent(event)
+        assert not event.isAccepted()
+        assert window._closing is False
+        monkeypatch.setattr(core_scanner.WiFiScanner, "start", lambda self: started.append(self))
+        assert window._start_scanner()
+        assert len(started) == 1
+    finally:
+        window._monitor_win = None
+        window._closing = True
+        for scanner in [window._scanner, *list(window._retired_scanners)]:
+            if scanner is not None:
+                scanner.stop(None)
         window.close()
 
 
